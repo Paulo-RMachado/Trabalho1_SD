@@ -23,23 +23,22 @@ public class Client {
 
     public static void main(String[] args) {
         Config config = parseArgs(args);
-        long startRealMs = System.currentTimeMillis();
-        AtomicLong clockOffsetMs = new AtomicLong(0L);
+        LocalClock clock = new LocalClock(config.initialClockMs, config.drift);
 
-        Thread listenerThread = new Thread(() -> runListener(config, startRealMs, clockOffsetMs), "client-listener");
+        Thread listenerThread = new Thread(() -> runListener(config, clock), "client-listener");
         listenerThread.setDaemon(true);
         listenerThread.start();
 
         System.out.println("Client port " + config.port + ", initial clock(ms)=" + config.initialClockMs
-                + ", interval(ms)=" + config.intervalMs);
+                + ", interval(ms)=" + config.intervalMs + ", drift=" + config.drift);
 
         while (true) {
             try {
                 if (isMaster(config)) {
-                    syncRound(config, startRealMs, clockOffsetMs);
+                    syncRound(config, clock);
                 }
-                long now = currentTimeMs(config, startRealMs, clockOffsetMs);
-                System.out.println("Clock(ms)=" + now + ", offset(ms)=" + clockOffsetMs.get());
+                long now = clock.currentTimeMs();
+                System.out.println("Clock(ms)=" + now + ", offset(ms)=" + clock.getOffsetMs());
                 Thread.sleep(config.intervalMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -48,12 +47,12 @@ public class Client {
         }
     }
 
-    private static void runListener(Config config, long startRealMs, AtomicLong clockOffsetMs) {
+    private static void runListener(Config config, LocalClock clock) {
         System.out.println("Listener active on port " + config.port);
         try (ServerSocket serverSocket = new ServerSocket(config.port)) {
             while (true) {
                 try (Socket socket = serverSocket.accept()) {
-                    handleConnection(socket, config, startRealMs, clockOffsetMs);
+                    handleConnection(socket, config, clock);
                 } catch (IOException e) {
                     System.out.println("Connection error: " + e.getMessage());
                 }
@@ -63,7 +62,7 @@ public class Client {
         }
     }
 
-    private static void handleConnection(Socket socket, Config config, long startRealMs, AtomicLong clockOffsetMs) throws IOException {
+    private static void handleConnection(Socket socket, Config config, LocalClock clock) throws IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
         PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
 
@@ -75,7 +74,7 @@ public class Client {
         String[] parts = line.trim().split("\\s+");
         if (parts.length == 2 && "TIME".equalsIgnoreCase(parts[0])) {
             long serverTime = parseLong(parts[1]);
-            long clientNow = currentTimeMs(config, startRealMs, clockOffsetMs);
+            long clientNow = clock.currentTimeMs();
             long diff = clientNow - serverTime;
             writer.println("DIFF " + diff);
 
@@ -84,16 +83,11 @@ public class Client {
                 String[] adjustParts = adjustLine.trim().split("\\s+");
                 if (adjustParts.length == 2 && "ADJUST".equalsIgnoreCase(adjustParts[0])) {
                     long delta = parseLong(adjustParts[1]);
-                    clockOffsetMs.addAndGet(delta);
-                    System.out.println("Applied adjust(ms)=" + delta + ", clock offset(ms)=" + clockOffsetMs.get());
+                    clock.addOffset(delta);
+                    System.out.println("Applied adjust(ms)=" + delta + ", clock offset(ms)=" + clock.getOffsetMs());
                 }
             }
         }
-    }
-
-    private static long currentTimeMs(Config config, long startRealMs, AtomicLong clockOffsetMs) {
-        long elapsed = System.currentTimeMillis() - startRealMs;
-        return config.initialClockMs + elapsed + clockOffsetMs.get();
     }
 
     private static boolean isMaster(Config config) {
@@ -115,8 +109,8 @@ public class Client {
         }
     }
 
-    private static void syncRound(Config config, long startRealMs, AtomicLong clockOffsetMs) {
-        long masterNow = currentTimeMs(config, startRealMs, clockOffsetMs);
+    private static void syncRound(Config config, LocalClock clock) {
+        long masterNow = clock.currentTimeMs();
         List<ClientSession> sessions = new ArrayList<>();
 
         for (Peer peer : config.peers) {
@@ -186,6 +180,7 @@ public class Client {
         Long initialClockMs = null;
         Integer port = null;
         Long intervalMs = null;
+        Double drift = null;
         String peersArg = null;
 
         for (int i = 0; i < args.length; i++) {
@@ -196,6 +191,8 @@ public class Client {
                 port = (int) parseLong(args[++i]);
             } else if ("-i".equals(arg) && i + 1 < args.length) {
                 intervalMs = parseLong(args[++i]);
+            } else if ("-drift".equals(arg) && i + 1 < args.length) {
+                drift = parseDouble(args[++i]);
             } else if ("-peers".equals(arg) && i + 1 < args.length) {
                 peersArg = args[++i];
             } else if ("-h".equals(arg) || "--help".equals(arg)) {
@@ -210,13 +207,16 @@ public class Client {
         if (intervalMs == null || intervalMs <= 0L) {
             intervalMs = 5000L;
         }
+        if (drift == null || drift <= 0.0d) {
+            drift = 1.0d;
+        }
 
         List<Peer> peers = parsePeers(peersArg);
         if (peers.isEmpty()) {
             printUsageAndExit();
         }
 
-        return new Config(port, initialClockMs, intervalMs, peers);
+        return new Config(port, initialClockMs, intervalMs, drift, peers);
     }
 
     private static List<Peer> parsePeers(String peersArg) {
@@ -243,7 +243,7 @@ public class Client {
     }
 
     private static void printUsageAndExit() {
-        System.out.println("Usage: java Client -p <port> -d <initialClockMs> -peers <host:port,host:port> -i <intervalMs>");
+        System.out.println("Usage: java Client -p <port> -d <initialClockMs> -peers <host:port,host:port> -i <intervalMs> -drift <factor>");
         System.exit(1);
     }
 
@@ -251,17 +251,55 @@ public class Client {
         final int port;
         final long initialClockMs;
         final long intervalMs;
+        final double drift;
         final List<Peer> peers;
         final int connectTimeoutMs;
         final int ioTimeoutMs;
 
-        Config(int port, long initialClockMs, long intervalMs, List<Peer> peers) {
+        Config(int port, long initialClockMs, long intervalMs, double drift, List<Peer> peers) {
             this.port = port;
             this.initialClockMs = initialClockMs;
             this.intervalMs = intervalMs;
+            this.drift = drift;
             this.peers = peers;
             this.connectTimeoutMs = 800;
             this.ioTimeoutMs = 1000;
+        }
+    }
+
+    private static class LocalClock {
+        private final long initialClockMs;
+        private final long startNano;
+        private final double drift;
+        private final AtomicLong offsetMs;
+
+        LocalClock(long initialClockMs, double drift) {
+            this.initialClockMs = initialClockMs;
+            this.startNano = System.nanoTime();
+            this.drift = drift;
+            this.offsetMs = new AtomicLong(0L);
+        }
+
+        long currentTimeMs() {
+            long elapsedNs = System.nanoTime() - startNano;
+            long elapsedMs = Math.round((elapsedNs / 1_000_000.0d) * drift);
+            return initialClockMs + elapsedMs + offsetMs.get();
+        }
+
+        void addOffset(long deltaMs) {
+            offsetMs.addAndGet(deltaMs);
+        }
+
+        long getOffsetMs() {
+            return offsetMs.get();
+        }
+    }
+
+    private static double parseDouble(String value) {
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return 0.0d;
         }
     }
 
